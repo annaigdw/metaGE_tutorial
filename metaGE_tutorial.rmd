@@ -1,0 +1,293 @@
+---
+title: "metaGE R package tutorial"
+format: html
+author: 
+  - Annaïg De Walsche
+date: last-modified
+---
+
+This tutorial explains how to use the [`{metaGE}` R package](https://cran.r-project.org/web/packages/metaGE/index.html) for performing meta-analysis of genome-wide association studies to investigate gene-environments interactions, as described in [De Walsche et al. (2025)](https://journals.plos.org/plosgenetics/article?id=10.1371/journal.pgen.1011553).
+
+This script will walk through all the steps for applying this methodology to genome-wide association studies (GWAS) results from the Amaizing experimentation.
+
+# Package installation
+
+To begin, install the `{metaGE}` package if you haven't already:
+
+```{r install metaGE,warning=FALSE,message=FALSE}
+if (!require('metaGE')){
+  install.packages('metaGE')
+} 
+library(metaGE)
+```
+
+Additionally, the following R packages are required for data processing and visualization:
+
+```{r lib,warning=FALSE,message=FALSE}
+library(tidyverse)
+library(data.table)
+library(tictoc)
+
+## For graphical display
+library(corrplot)
+```
+
+# Download the data
+
+You can download the GWAS results contained in **2-AmaizingDROPS_GWAS_results.zip** from the following repository: <https://doi.org/10.57745/VLYYFZ>. After downloading, unzip the files into a folder named **amaizingDROPS_GWAS**.
+
+The dataset comes from [Millet et al. (2016)](https://doi.org/10.1104/pp.16.00621), where GWAS analyses were performed on a panel of 244 maize dent lines evaluated as hybrids with a common parental line in 22 environments (combinations of location $\times$ year $\times$ treatment). Each line was genotyped at 602,356 SNPs (after quality control) and phenotyped for grain yield in the 22 environments.
+
+# Build the dataset
+
+We'll begin by listing the files that contain the GWAS results for each environment.
+
+```{r listing files of GWAS results}
+## Get the folder containing the association file
+RepData <- "C:/Users/Annaig/Desktop/data/tutorials/amaizingDROPS_GWAS/"
+Trait <- "GY"
+
+## Get the complete list of association files
+File.list <- list.files(RepData ,full.names = TRUE) %>% 
+  .[str_detect(string = ., pattern = Trait)] %>% 
+  tibble(Names = .) %>% 
+  mutate(ShortNames = Names %>%
+           str_remove(pattern = RepData) %>%
+           str_remove(pattern = ".txt") %>%
+           str_remove(pattern = "GNPasso_"))  %>%
+  select(ShortNames,Names) %>% 
+  deframe
+
+## Provide short names
+EnvDesc <- read.csv("C:/Users/Annaig/Desktop/metage/Tutorials/EnvDesc.txt")
+names(File.list) <- EnvDesc$ShortName[match(EnvDesc$Filename, names(File.list))]
+
+```
+
+Let's take a look at the data from one of the files:
+
+```{r looking at single file }
+## Have a look at the first one
+fread(File.list[1]) %>% head() 
+```
+
+Next, we combine all the association results into a single dataset using the `metaGE.collect` function. Note that files might not contain the same set of SNPs, leading to missing data (NAs). By default, rows with NAs will be removed, but you can keep them by setting NA.rmv = FALSE.
+
+```{r metaGE collect}
+###Build the dataset
+## First provide the variable names of the file
+Names.list <- list(MARKER="Marker_Name",
+                   CHR="Chromosome",
+                   POS="Marker_Position",
+                   FREQ="Maf",
+                   EFFECT="SNP_Weight",
+                   PVAL="Pvalue",
+                   ALLELE0="Allele1",
+                   ALLELE1="Allele2")
+
+## For filtering on Maf
+MinFreq <- 0
+
+## Now collect
+MetaData <- metaGE.collect(FileNames = File.list, VariableNames = Names.list, MinFreq = MinFreq, NA.rmv = FALSE)
+head(MetaData$Data[,1:10])
+```
+
+# Accounting for correlations between environments
+
+This can be done using the `metaGE.cor` function. This function takes as input the merged dataset and a threshold for the filtering of markers (based on there probabilities to be significant in some environments):
+
+```{r build matcorr}
+Threshold <- 0.6
+MatCorr <- metaGE.cor(MetaData$Data, Threshold = Threshold)
+```
+
+Here is what the correlation matrix looks like:
+
+```{r corrplot}
+corrplot(MatCorr,order = "hclust",hclust.method = "ward.D")
+```
+
+# Global meta-analysis procedure
+
+Different model may be fitted with the `metaGE.fit` function depending on the input `Method` : - if `Method = 'Fe'`, then Fixed Effect (Fe) model is fitted, and a test to identify globally significant markers is performed. - if `Method ='Re'`, then Random Effect (Re) model is fitted, and a test that allows some heterogeneity on the effect of the marker is performed.
+
+```{r RE fit}
+# Random effect procedure
+ReDF <- metaGE.fit(MetaData$Data, MatCorr, Method = "Re",NA.omit = FALSE)
+head(ReDF) %>% select(CHR, POS, MARKER, Mu, Tau, PVALUE)
+```
+
+One can have a look at the pvalues one gets for the different sets of tests, to check for any problem. This can be done using the `metaGE.pvalplot` function which display the pvalue distribution and the QQplot of the -log10(pvalues).
+
+```{r pval plot}
+par(mfrow=c(1,2))
+metaGE.pvalplot(ReDF$PVALUE, Main='')
+```
+
+## Multiple test correction: Local score
+
+Let apply some multiple testing procedure to control the FDR: here the local score approach, developed by Fariello MI et al.(2017), using the `metaGE.lscore`. The local score approach aims at detecting significant regions in a genome sequence by the accumulation of single marker p-values. The technical details of the computation can be found in [Fariello MI et al. (2017)](https://doi.org/10.1111/mec.14141).
+
+```{r local score Re}
+ReDF <- ReDF %>% arrange(CHR, POS)
+ReDF_ls <- metaGE.lscore(Data = ReDF, PvalName = "PVALUE", xi=3)
+```
+
+Here are displayed the information on the significant regions.
+
+```{r RE sigzones}
+ReDF_ls$SigZones %>% arrange(CHR, Start)%>% head() 
+```
+
+## Check the candidates
+
+One can draw the manhattan plot of the local score along the chromosomes using the `metaGE.manhattan` function.
+
+```{r manhattan plot Re, warning=FALSE}
+manhattan_re <- metaGE.manhattan(Data = ReDF_ls$Data,VarName = "SCORE",SigZones = ReDF_ls$SigZones,Score = TRUE,Ylim = c(0,20) )
+print(manhattan_re)
+```
+
+One can draw the z-scores heatmap of some QTLs using the `metaGE.heatmap` function.
+
+```{r heatmap Re}
+th_score <- (ReDF_ls$SigMarker %>% filter(REGION==11) %>% arrange(desc(SCORE)))[1:100,] %>% pull(SCORE) %>% min()
+
+heatmapDF <- merge(x = (ReDF_ls$SigMarker %>% filter( REGION==36  | (REGION==11 & SCORE>= th_score))),y = ReDF,by =c("CHR","POS","MARKER") ) 
+
+heatmap_plot <- metaGE.heatmap(Data=heatmapDF,Prefix = "Z.",QTLsVarName = "REGION",ColOrder = TRUE)
+
+```
+
+# Investigation of GxE interactions
+
+Different tests may be performed with the `metaGE.test` function depending on the argument :
+
+-   if `Covariate` is provided to the function, then meta-regression test is performed to identify markers with effects correlated to environmental covariate,
+-   if `Incidence` is provided to the function and `Contrast = NULL`, then a test of contrast to identify markers significant for at least one subclass of environments is performed.
+-   if `Incidence` and `Contrast` are provided to the function, then the test of contrast specified is performed.
+
+One can perform several tests by providing a list of the arguments `Contrast` and/or `Incidence` and/or `Covariate`.
+
+Some covariates describing the environments are available in the **EnvDesc** dataset:
+
+```{r environment data}
+EnvDesc %>% head() 
+```
+
+## Tests of meta-regression
+
+One may want to identify markers whose effects are correlated to environments covariate. These can be done by performing a meta-regression test thanks to the function `metaGE.test`. A meta-regression test is performed on each variable in the dataset `Covariate`, except the one which corresponds to the environments name.
+
+```{r metaregression test}
+RegressionDF <- metaGE.test(Data=MetaData$Data,MatCorr = MatCorr,Covariate = EnvDesc[,c(1,11,14)] ,EnvName = "ShortName",NA.omit = FALSE)
+```
+
+### Multiple test correction: Local score
+
+Let apply some multiple testing procedure to control the FDR: here the local score approach, developed by Fariello MI, Boitard S, Mercier S, et al.(2017), using the `metaGE.lscore`.
+
+```{r local score meta reg}
+ET0DF_ls <- metaGE.lscore(Data = RegressionDF,PvalName = "PVALUE.ET0.mean",xi=3)
+TnightDF_ls <- metaGE.lscore(Data = RegressionDF,PvalName = "PVALUE.Tnight.mean",xi=3)
+```
+
+Here are the significant regions whose effects are correlated to the evapotranspiration and the night temperature, respectively:
+
+```{r significant zones meta reg}
+ET0DF_ls$SigZones %>% arrange(CHR, Start) %>% head() 
+
+TnightDF_ls$SigZones %>% arrange(CHR, Start) %>% head() 
+
+```
+
+### Check the candidates
+
+One can draw the manhattan plot of the local score along the chromosomes using the `metaGE.manhattan` function.
+
+```{r manhattan plot et0, warning=FALSE}
+manhattan_et0 <- metaGE.manhattan(Data = ET0DF_ls$Data,VarName = "SCORE",SigZones = ET0DF_ls$SigZones,Score = T,Ylim =c(0,20))
+manhattan_et0
+
+```
+
+One can displays the graph of the z-scores of a marker according to the covariate using the `metaGE.regplot`function.
+
+```{r reg plot et0}
+pplot_ET0 <- metaGE.regplot(Data = RegressionDF, Covariate  = envDesc,EnvName ="ShortName" , MarkerName = "AX-91538480", VarName = "ET0.mean",Zscore=TRUE,Main = '')
+print(pplot_ET0 + xlab("Evapotranpiration (mm)"))
+```
+
+```{r reg plot tnight}
+pplot_Tnight <- metaGE.regplot(Data = RegressionDF, Covariate  = envDesc,EnvName ="ShortName" , MarkerName = "AX-91369217", VarName = "Tnight.mean",Zscore=T,Main = '')
+
+print(pplot_Tnight+xlab('Night Temperature (°C)'))
+
+```
+
+## Tests of contrast
+
+One may want to identify markers with contrasted effect depending on environmental conditions. These can be done by performing a test of contrast thanks to the function `metaGE.test`.
+
+First, one must build the incidence matrix using the `metaGE.incidence` function.
+
+```{r incidence matrix}
+## Build the incidence matrix 
+(Incidence.Temp <- metaGE.incidence(VarName = "Temp",Covariate = EnvDesc,EnvName = "ShortName", Data = MetaData$Data))
+
+```
+
+One can test whether the markers are significant in at least one environment subclass by setting `Contrast` to `NULL`. One can also identify significant markers with a distinct effect for the different subclasses of environments by specifying the appropriate `Contrast`.
+
+One can use the `metaGE.test` function to perform tests of contrast.
+
+```{r metaGE contrast test}
+## Build the list of Incidence
+Incidence.list <- list(Temp = Incidence.Temp,
+                       Diff.Temp = Incidence.Temp)
+
+#Build the list of Contrast
+Contrast.list <- list(Temp = NULL,
+                      Diff.Temp = matrix(c(1,-1,0,0,1,-1),2,byrow = T)) 
+
+
+ContrastDF <- metaGE.test(Data = MetaData$Data, MatCorr = MatCorr,
+                          Incidence = Incidence.list,
+                          Contrast = Contrast.list)
+```
+
+### Multiple test correction: Local score
+
+Let apply some multiple testing procedure to control the FDR: here the local score approach, developed by Fariello MI, Boitard S, Mercier S, et al.(2017), using the `metaGE.lscore`.
+
+```{r local score contrast}
+TempDF_ls <- metaGE.lscore(Data = ContrastDF,PvalName = "PVALUE.Temp",xi=3)
+DiffTempDF_ls <- metaGE.lscore(Data = ContrastDF,PvalName = "PVALUE.Diff.Temp",xi=3)
+```
+
+Here are the regions with significant effect in at least one environment subclass and with a contrasted effect for the different subclasses of environments, respectively:
+
+```{r significant zones contrast}
+TempDF_ls$SigZones %>% arrange(CHR, Start) %>% head() 
+
+DiffTempDF_ls$SigZones %>% arrange(CHR, Start) %>% head() 
+
+```
+
+One can draw the corresponding heatmap using the `metaGE.heatmap` :
+
+```{r contrast heatmap}
+
+heatmapDF <- merge(x = (TempDF_ls$SigMarker %>% filter( REGION==6  | REGION==7 | REGION==8)),y = ReDF,by =c("CHR","POS","MARKER") ) 
+
+heatmap_plot <- metaGE.heatmap(Data=heatmapDF,Prefix = "Z.",QTLsVarName = "REGION",ColOrder = TRUE,EnvGroups = EnvDesc[,c(1,7)])
+
+```
+
+```{r contrast heatmap diff temp}
+heatmapDF <- merge(x = (DiffTempDF_ls$SigMarker %>% filter( REGION==5  | REGION==27 | REGION==30)),y = ReDF,by =c("CHR","POS","MARKER") ) 
+
+heatmap_plot <- metaGE.heatmap(Data=heatmapDF,Prefix = "Z.",QTLsVarName = "REGION",ColOrder = TRUE,EnvGroups = EnvDesc[,c(1,7)])
+
+```
